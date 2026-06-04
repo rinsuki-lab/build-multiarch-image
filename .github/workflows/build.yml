@@ -1,0 +1,123 @@
+name: Build Multi-Arch Image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        required: true
+      push:
+        type: boolean
+        required: true
+      registry:
+        type: string
+        required: true
+    secrets:
+      docker_username:
+        required: true
+      docker_password:
+        required: true
+    outputs:
+      digest:
+        value: ${{ jobs.merge.outputs.digest }}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - host: ubuntu-24.04
+            arch: amd64
+          - host: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.host }}
+    steps:
+    - uses: docker/setup-buildx-action@v4
+    - uses: docker/login-action@v4
+      if: inputs.push
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ secrets.docker_username }}
+        password: ${{ secrets.docker_password }}
+    - name: Extract metadata for sub-image
+      id: meta
+      uses: docker/metadata-action@v6
+      with:
+        images: ${{ inputs.image }}
+      env:
+        DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+    - uses: docker/build-push-action@v7
+      id: push
+      with:
+        push: ${{ inputs.push }}
+        provenance: mode=max
+        sbom: true
+        labels: ${{ steps.meta.outputs.labels }}
+        annotations: ${{ steps.meta.outputs.annotations }}
+        outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true
+    - name: Export digest
+      if: inputs.push
+      run: |
+        mkdir -p ${{ runner.temp }}/digests
+        digest="${{ steps.push.outputs.digest }}"
+        touch "${{ runner.temp }}/digests/${digest#sha256:}"
+    - name: Upload digest
+      uses: actions/upload-artifact@v7
+      if: inputs.push
+      with:
+        name: digests-${{ matrix.arch }}
+        path: ${{ runner.temp }}/digests/*
+        if-no-files-found: error
+        retention-days: 1
+  merge:
+    runs-on: ubuntu-24.04
+    needs: build
+    if: inputs.push
+    permissions:
+      id-token: write
+      attestations: write
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+    - name: Download digests
+      uses: actions/download-artifact@v8
+      with:
+        path: ${{ runner.temp }}/digests
+        pattern: digests-*
+        merge-multiple: true
+    - uses: docker/metadata-action@v6
+      with:
+        images: ${{ inputs.image }}
+        tags:
+          type=ref,event=branch
+      env:
+        DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+    - uses: docker/login-action@v4
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ secrets.docker_username }}
+        password: ${{ secrets.docker_password }}
+    - name: Create manifest list and push
+      working-directory: ${{ runner.temp }}/digests
+      id: push
+      run: |
+        set -x
+        args=()
+
+        while IFS= read -r tag; do
+          args+=("-t" "$tag")
+        done < <(echo "$DOCKER_METADATA_OUTPUT_JSON" | jq -r '.tags[]')
+
+        while IFS= read -r annotation; do
+          args+=("--annotation" "$annotation")
+        done < <(echo "$DOCKER_METADATA_OUTPUT_JSON" | jq -r '.annotations[]')
+
+        for digest in *; do
+          args+=("${{ inputs.image }}@sha256:$digest")
+        done
+
+        docker buildx imagetools create "${args[@]}" 2>&1 | tee ${{ runner.temp }}/imagetools.create.log
+        echo "digest=$(sed -nE 's/.*pushing (sha256:[0-9a-f]{64}) to .*/\1/p' ${{ runner.temp }}/imagetools.create.log)" >> $GITHUB_OUTPUT
