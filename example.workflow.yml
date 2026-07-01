@@ -1,0 +1,22 @@
+name: Build Docker Image
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
+    uses: rinsuki-lab/build-multiarch-image/.github/workflows/build.yml@main
+    with:
+      image: docker.internal/rinsuki/${{ github.event.repository.name }}
+      push: ${{ github.event_name != 'pull_request' }}
+      registry: docker.internal
+    secrets:
+      docker_username: ${{ secrets.DOCKER_USERNAME }}
+      docker_password: ${{ secrets.DOCKER_PASSWORD }}
